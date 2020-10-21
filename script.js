@@ -1,113 +1,148 @@
 {
   init: function(elevators, floors) {
 
-    // Floor queue that keeps data as lists with indexes
-    // representing the floor number and value the number
-    // of times an elevator is requested at that floor.
+    // Floor queue that keeps data about requested
+    // rides in both up and down directions.
     const floorQueue = {
       up: [],
       down: []
     }
 
-    function setElevatorDirection(elevator, currentFloor, nextFloor) {
-      if (currentFloor === nextFloor) {
+    function setElevatorIndicators(elevator, direction = null) {
+      if (direction) {
+        elevator.goingUpIndicator(direction === 'up')
+        elevator.goingDownIndicator(direction === 'down')
+      } else {
         elevator.goingUpIndicator(true)
         elevator.goingDownIndicator(true)
-      } else {
-        elevator.goingUpIndicator(currentFloor < nextFloor)
-        elevator.goingDownIndicator(currentFloor > nextFloor)
       }
     }
 
-    function requestElevatorAtFloor(elevator, floorNum, immediate = false) {
-      if (immediate) {
-        // Remove from queue since it will be pre-pended
-        elevator.destinationQueue = elevator.destinationQueue.filter(x => x !== !floorNum)
-      } else if (floorNum in elevator.destinationQueue) {
-        // Floor already in queue, exit.
-        return
-      }
-      elevator.goToFloor(floorNum, immediate)
-      setElevatorDirection(elevator, elevator.currentFloor(), elevator.destinationQueue[0])
-    }
+    function findElevatorNextFloor(elevator) {
+      // Find the preferred floors for elevator in both directions.
+      const floorsUp = floorQueue.up.filter(x => x > elevator.currentFloor())
+      const floorsDown = floorQueue.down.filter(x => x < elevator.currentFloor())
 
-    function requestElevator(elevator = null) {
-      // If no elevator passed in, pick the optimal one.
-      if (!elevator) {
-        elevator = elevators[0]
-        for (const el of elevators) {
-          if (el.destinationQueue.length < elevator.destinationQueue.length) {
-            elevator = el
-          }
-        }
-      }
+      // Set fallback floors that exclude current floor.
+      const otherUp = floorQueue.up.filter(x => x !== elevator.currentFloor())
+      const otherDown = floorQueue.down.filter(x => x !== elevator.currentFloor())
 
-      // Merge `up` and `down` floor queues.
-      const allFloorsQueue = []
-      for (let i in floors) {
-        allFloorsQueue.push(floorQueue.up[i] + floorQueue.down[i])
-      }
-
-      // Find the nearest floor with passengers.
       let nextFloor = null
-      const n = elevator.currentFloor()
-      for (let i = 1; i <= floors.length; i++) {
-        if (allFloorsQueue[n + i]) nextFloor = n + i
-        if (allFloorsQueue[n - i]) nextFloor = n - i
-        if (nextFloor !== null) {
-          requestElevatorAtFloor(elevator, nextFloor)
-          break
-        }
+      let direction = null
+
+      if (floorsUp.length) {
+        // There are upper floors with passengers going up.
+        nextFloor = Math.min(...floorsUp)
+        direction = 'up'
+      }
+      else if (floorsDown.length) {
+        // There are lower floors with passengers going down.
+        nextFloor = Math.max(...floorsDown)
+        direction = 'down'
+      }
+      else if (otherUp.length) {
+        // There are lower floors with passengers going up.
+        nextFloor = Math.min(...otherUp)
+        direction = 'down'
+      }
+      else if (otherDown.length) {
+        // There are upper floors with passengers going down.
+        nextFloor = Math.max(...otherDown)
+        direction = 'up'
+      }
+
+      return [nextFloor, direction]
+    }
+
+    function runElevator(elevator) {
+      const [nextFloor, direction] = findElevatorNextFloor(elevator)
+
+      // Set elevator direction.
+      // If direction is null turn's on all indicators.
+      setElevatorIndicators(elevator, direction)
+
+      if (nextFloor !== null) {
+        // Remove next floor from queue.
+        floorQueue[direction] = floorQueue[direction].filter(x => x !== nextFloor)
+
+        // Go to next floor.
+        elevator.goToFloor(nextFloor)
+      } else {
+        // Queue is empty, wait.
+        elevator.stop()
       }
     }
 
-    for (const elevator of elevators) {
+    for (const i in elevators) {
+      const elevator = elevators[i]
+      elevator.id = i
 
       elevator.on('idle', function() {
-        requestElevator(elevator)
+        runElevator(elevator)
       })
 
       elevator.on('floor_button_pressed', function(floorNum) {
-        requestElevatorAtFloor(elevator, floorNum)
+        if (!(floorNum in elevator.destinationQueue)) {
+          elevator.destinationQueue.push(floorNum)
+        }
+
+        // Sort elevator queue to keep it going in the same direction.
+        if (elevator.goingUpIndicator()) {
+          elevator.destinationQueue.sort((a, b) => a - b)
+          floorQueue.up = floorQueue.up.filter(x => x !== floorNum)
+        } else if (elevator.goingDownIndicator()) {
+          elevator.destinationQueue.sort((a, b) => b - a)
+          floorQueue.down = floorQueue.down.filter(x => x !== floorNum)
+        }
+
+        // Remove duplicates.
+        elevator.destinationQueue = [...new Set(elevator.destinationQueue)]
+        elevator.checkDestinationQueue()
       })
 
       elevator.on('passing_floor', function(floorNum, direction) {
-        // Check if floor contains passengers that are waiting for a
-        // ride in the same direction, but also that the elevator has
-        // room for more passengers.
-        if (floorQueue[direction][floorNum] && elevator.loadFactor() <= 0.8) {
-          requestElevatorAtFloor(elevator, floorNum, true)
-          // Clear queue for floor.
-          floorQueue[direction][floorNum] = 0
+        const isSameDirection = (
+          direction === 'up' && elevator.goingUpIndicator() ||
+          direction === 'down' && elevator.goingDownIndicator()
+        )
+        const isInQueue = floorQueue[direction].includes(floorNum)
+
+        const isEligibleForPickup = isInQueue && isSameDirection && elevator.loadFactor() <= 0.6
+        const isInPressedFloors = elevator.getPressedFloors().includes(floorNum)
+
+        // If a floor queue exists in the same direction the elevator is
+        // headed + the elevator has room, pick up the passengers.
+        if (isInPressedFloors || isEligibleForPickup) {
+          // Place passing floor to the front of queue
+          // ensuring that it's removed if already exists.
+          elevator.destinationQueue = [
+            floorNum, ...elevator.destinationQueue.filter(x => x !== floorNum)
+          ]
+          elevator.checkDestinationQueue()
+          // Remove from floor queue.
+          floorQueue[direction] = floorQueue[direction].filter(x => x !== floorNum)
         }
       })
 
-      elevator.on('stopped_at_floor', function(floorNum) {
-        // Set indicators based on next floor queue.
-        const currentFloor = floorNum
-        const nextFloor = elevator.destinationQueue[0] || floorNum
-        setElevatorDirection(elevator, currentFloor, nextFloor)
-        // Clear floor queue for this floor.
-        if (elevator.destinationDirection() === 'stopped') {
-          floorQueue.up[floorNum] = floorQueue.down[floorNum] = 0
+      elevator.on('stopped_at_floor', function () {
+        // Set elevator indicators for top and bottom floor cases.
+        if (elevator.currentFloor() === 0) {
+          setElevatorIndicators(elevator, 'up')
+        } else if (elevator.currentFloor() === floors.length - 1) {
+          setElevatorIndicators(elevator, 'down')
         } else {
-          floorQueue[elevator.destinationDirection()][floorNum] = 0
+          setElevatorIndicators(elevator)
         }
       })
     }
 
     for (const floor of floors) {
-      const n = floor.floorNum()
-      floorQueue.up[n] = 0
-      floorQueue.down[n] = 0
-
+      // Add to floor queue.
       floor.on('up_button_pressed', function() {
-        floorQueue.up[n]++
-        requestElevator()
+        floorQueue.up.push(floor.floorNum())
       })
       floor.on('down_button_pressed', function() {
-        floorQueue.down[n]++
-        requestElevator()
+        floorQueue.down.push(floor.floorNum())
       })
     }
   },
